@@ -1,0 +1,6 @@
+.DS_Store
+.venv
+.swp
+__pycache__
+*.log
+data/cache

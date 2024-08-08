@@ -1,0 +1,36 @@
+unsafe-fixes = false
+
+[lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-comprehensions
+    "C",
+    # flake8-bugbear
+    "B",
+    # flake8-simplify
+    "SIM",
+    # flake8-commas
+    "COM",
+    # Sort imports
+    "I",
+]
+ignore = [
+    # Line too long
+    "E501",
+    # Trailing Commas
+    "COM812",
+    # Function too complex
+    "C901",
+]
+
+[lint.flake8-bugbear]
+extend-immutable-calls = [
+    # Whitelisted default arguments
+    "fastapi.Depends",
+    "fastapi.File",
+]

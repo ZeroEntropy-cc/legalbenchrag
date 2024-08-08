@@ -1,0 +1,11 @@
+# Production
+pydantic==2.8.2
+tiktoken==0.7.0
+openai==1.40.1
+anthropic==0.32.0
+voyageai==0.2.3
+cohere==5.6.2
+diskcache==5.6.3
+# Development
+mypy==1.11.1
+ruff==0.5.7
