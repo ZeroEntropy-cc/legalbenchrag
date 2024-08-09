@@ -3,4 +3,8 @@
 .swp
 __pycache__
 *.log
+
+credentials/*
+!credentials/credentials.example.toml
+
 data/cache

@@ -18,22 +18,14 @@ pip install pip-tools
 pip-sync
 ```
 
-3. Specify your API Keys in `./utils/ai.py`
-
-```python
-OPENAI_API_KEY = "YOUR_API_KEY"
-COHERE_API_KEY = "YOUR_API_KEY"
-ANTHROPIC_API_KEY = "YOUR_API_KEY"
-VOYAGE_API_KEY = "YOUR_API_KEY"
-```
-
-4. Create the cache directory
+3. Create your credentials.toml and set your API keys
 
 ```bash
-mkdir -p ./data/cache
+cp ./credentials/credentials.example.toml ./credentials/credentials.toml
+vim ./credentials/credentials.toml
 ```
 
-5. Run the test script
+4. Run the test script
 
 ```bash
 python test.py

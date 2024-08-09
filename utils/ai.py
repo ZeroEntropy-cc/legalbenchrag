@@ -1,9 +1,9 @@
 import asyncio
 import hashlib
 import logging
-from abc import ABC, abstractmethod
+import os
 from enum import Enum
-from typing import Literal, Optional
+from typing import Literal
 from uuid import UUID, uuid4
 
 import anthropic
@@ -19,42 +19,42 @@ from openai import AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, Field
 
+from credentials import credentials
+
 logger = logging.getLogger("uvicorn")
 
+os.makedirs("./data/cache", exist_ok=True)
 cache = dc.Cache("./data/cache/diskcache")
-
-OPENAI_API_KEY = "YOUR_API_KEY"
-COHERE_API_KEY = "YOUR_API_KEY"
-ANTHROPIC_API_KEY = "YOUR_API_KEY"
-VOYAGE_API_KEY = "YOUR_API_KEY"
-
-
-class KVStore(ABC):
-    @abstractmethod
-    async def get(self, key: str) -> Optional[str]: ...
-
-    @abstractmethod
-    async def set(self, key: str, value: str) -> None: ...
 
 
 class AIConnection:
     openai_client: AsyncOpenAI
-    voyage_client: voyageai.AsyncClient
+    voyageai_client: voyageai.AsyncClient
     cohere_client: cohere.AsyncClient
     anthropic_client: AsyncAnthropic
     sync_anthropic_client: Anthropic
     # Share one global Semaphore across all threads
     cohere_ratelimit_semaphore = asyncio.Semaphore(1)
-    voyage_ratelimit_semaphore = asyncio.Semaphore(1)
+    voyageai_ratelimit_semaphore = asyncio.Semaphore(1)
     openai_ratelimit_semaphore = asyncio.Semaphore(1)
     anthropic_ratelimit_semaphore = asyncio.Semaphore(1)
 
     def __init__(self) -> None:
-        self.openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-        self.voyage_client = voyageai.AsyncClient(api_key=VOYAGE_API_KEY)
-        self.cohere_client = cohere.AsyncClient(api_key=COHERE_API_KEY)
-        self.anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-        self.sync_anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.openai_client = AsyncOpenAI(
+            api_key=credentials.ai.openai_api_key.get_secret_value()
+        )
+        self.anthropic_client = AsyncAnthropic(
+            api_key=credentials.ai.anthropic_api_key.get_secret_value()
+        )
+        self.sync_anthropic_client = Anthropic(
+            api_key=credentials.ai.anthropic_api_key.get_secret_value()
+        )
+        self.voyageai_client = voyageai.AsyncClient(
+            api_key=credentials.ai.voyageai_api_key.get_secret_value()
+        )
+        self.cohere_client = cohere.AsyncClient(
+            api_key=credentials.ai.cohere_api_key.get_secret_value()
+        )
 
 
 # NOTE: API Clients cannot be called from multiple event loops,
@@ -147,7 +147,7 @@ async def ai_call(
                 try:
                     # Guard with ratelimit
                     async with get_ai_connection().openai_ratelimit_semaphore:
-                        tpm = 200000
+                        tpm = 2000000
                         ratio = 0.95
                         expected_wait = num_tokens_input / (tpm * ratio / 60)
                         await asyncio.sleep(expected_wait)
@@ -271,7 +271,7 @@ async def ai_call(
 
 
 class AIEmbeddingModel(BaseModel):
-    company: Literal["openai", "cohere", "voyage"]
+    company: Literal["openai", "cohere", "voyageai"]
     model: str
 
 
@@ -336,12 +336,12 @@ async def ai_embedding(
                         await asyncio.sleep(1)
             if embedding is None:
                 raise TimeoutError("Cannot overcome Cohere RateLimitError")
-        case "voyage":
+        case "voyageai":
             for _ in range(10):
                 try:
-                    async with get_ai_connection().voyage_ratelimit_semaphore:
+                    async with get_ai_connection().voyageai_ratelimit_semaphore:
                         await asyncio.sleep(60 / 90)
-                    result = await get_ai_connection().voyage_client.embed(
+                    result = await get_ai_connection().voyageai_client.embed(
                         [text],
                         model=model.model,
                         input_type=(
@@ -355,7 +355,7 @@ async def ai_embedding(
                     break
                 except voyageai.error.RateLimitError:
                     logger.warning("VoyageAI RateLimitError")
-                    async with get_ai_connection().voyage_ratelimit_semaphore:
+                    async with get_ai_connection().voyageai_ratelimit_semaphore:
                         await asyncio.sleep(10)
             if embedding is None:
                 raise TimeoutError("Cannot overcome VoyageAI RateLimitError")
@@ -364,7 +364,7 @@ async def ai_embedding(
 
 
 class AIRerankModel(BaseModel):
-    company: Literal["cohere", "voyage"]
+    company: Literal["cohere", "voyageai"]
     model: str
 
 
@@ -414,22 +414,26 @@ async def ai_rerank(
                         await asyncio.sleep(1)
             if indices is None:
                 raise TimeoutError("Cannot overcome Cohere RateLimitError")
-        case "voyage":
+        case "voyageai":
             for _ in range(10):
                 try:
-                    async with get_ai_connection().voyage_ratelimit_semaphore:
+                    async with get_ai_connection().voyageai_ratelimit_semaphore:
                         await asyncio.sleep(1)
-                    voyage_response = await get_ai_connection().voyage_client.rerank(
-                        query=query,
-                        documents=texts,
-                        model=model.model,
-                        top_k=top_k,
+                    voyageai_response = (
+                        await get_ai_connection().voyageai_client.rerank(
+                            query=query,
+                            documents=texts,
+                            model=model.model,
+                            top_k=top_k,
+                        )
                     )
-                    indices = [int(result.index) for result in voyage_response.results]
+                    indices = [
+                        int(result.index) for result in voyageai_response.results
+                    ]
                     break
                 except voyageai.error.RateLimitError:
                     logger.warning("VoyageAI RateLimitError")
-                    async with get_ai_connection().voyage_ratelimit_semaphore:
+                    async with get_ai_connection().voyageai_ratelimit_semaphore:
                         await asyncio.sleep(30)
             if indices is None:
                 raise TimeoutError("Cannot overcome VoyageAI RateLimitError")
