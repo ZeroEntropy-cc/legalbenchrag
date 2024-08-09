@@ -14,3 +14,4 @@ ruff==0.5.7
 # - Types
 types-tqdm==4.66.0.20240417
 pandas-stubs==2.2.2.240807
+types-setuptools==71.1.0.20240806

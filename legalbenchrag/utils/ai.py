@@ -19,7 +19,7 @@ from openai import AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, Field
 
-from credentials import credentials
+from legalbenchrag.utils.credentials import credentials
 
 logger = logging.getLogger("uvicorn")
 

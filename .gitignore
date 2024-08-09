@@ -11,6 +11,9 @@ tmp
 data/cache
 data/raw_data
 
+# TODO: Think about .egg-info at a later time
+LegalBenchRAG.egg-info
+
 # TODO: Use git-lfs
 data/benchmarks
 data/corpus

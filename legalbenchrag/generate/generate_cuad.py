@@ -9,11 +9,10 @@ from typing import Any, cast
 
 import pandas as pd
 import requests
-from pydantic import BaseModel
 from tqdm import tqdm
 
-from benchmark_types import QA, Benchmark, Snippet
-from utils.ai import AIMessage, AIModel, ai_call
+from legalbenchrag.benchmark_types import QA, Benchmark, Snippet, sort_and_merge_spans
+from legalbenchrag.generate.utils import WRITE_TITLES, create_title
 
 save_path = "./data/raw_data/cuad"
 
@@ -52,78 +51,6 @@ def download_cuad() -> None:
     print("Download and extraction completed successfully.")
 
 
-TITLE_SYSTEM_PROMPT = (
-    """
-# Instructions
-
-The User will provide to you a very long contract. Your job is to create a reasonable title of it.
-Keep the title succinct and clear.
-You MUST mention the relevant companies involved in the contract, and what the contract purpose and topic is.
-
-# Format
-
-Your output format should be JSON, matching the following JSON schema.
-
-{
-  "$schema": "http://json-schema.org/draft-07/schema#",
-  "type": "object",
-  "properties": {
-    "title": {
-      "type": ["string"],
-      "description": "A reasonable and succinct title for the contract, including all parties and companies involved, and what the contract's purpose is."
-    }
-  },
-  "required": ["title"],
-  "additionalProperties": false
-}
-
-Here's an example,
-{
-  "title": "Licensing Agreement between Company A and Company B",
-}
-
-Do NOT output ```json OR ```.
-""".strip()
-    + "\n"
-)
-
-TITLE_USER_PROMPT = (
-    """
-FILENAME: {FILENAME}
-CONTENT:
-{CONTENT}
-""".strip()
-    + "\n"
-)
-
-
-class TitleResponse(BaseModel):
-    title: str
-
-
-async def create_title(filename: str, text: str) -> str:
-    if len(text) > 30000:
-        text = text[:10000] + text[-10000:]
-    response = await ai_call(
-        model=AIModel(company="openai", model="gpt-4o-mini"),
-        messages=[
-            AIMessage(role="system", content=TITLE_SYSTEM_PROMPT),
-            AIMessage(
-                role="user",
-                content=TITLE_USER_PROMPT.format(
-                    FILENAME=filename,
-                    CONTENT=text,
-                ),
-            ),
-        ],
-    )
-    response = response.strip()
-    if response.endswith(",\n}"):
-        response = response[:-3] + "\n}"
-    title_response = TitleResponse.model_validate_json(response)
-    return title_response.title
-
-
 def filename_pdf_to_text(pdf_filename: str) -> str:
     return pdf_filename.replace(".pdf", ".txt").replace(".PDF", ".txt")
 
@@ -142,7 +69,7 @@ def extract_quote_span(text: str, quote: str) -> tuple[int, int] | None:
     return start_idx, start_idx + len(quote)
 
 
-async def process_cuad() -> None:
+async def generate_cuad() -> None:
     download_cuad()
 
     df = pd.read_csv(f"{save_path}/CUAD_v1/master_clauses.csv")
@@ -192,9 +119,8 @@ async def process_cuad() -> None:
 
         filtered_extracted_rows.append(extracted_row)
 
-    WRITE_TITLES = False
     if WRITE_TITLES:
-        with open("./tmp/titles.csv", "w") as f:
+        with open("./tmp/cuad_titles.txt", "w") as f:
             for i, title in filtered_extracted_rows:
                 f.write(f"{i}: {df.loc[i, "Filename"]} -> {title}\n")
 
@@ -255,28 +181,29 @@ async def process_cuad() -> None:
                 quotes.append(any_quote)
 
             # Save the query
-            snippets: list[Snippet] = []
+            spans: list[tuple[int, int]] = []
             failed = False
             for quote in quotes:
                 index_span = extract_quote_span(text, quote)
-                if index_span:
-                    used_filenames.add(filename)
-                    snippets.append(
-                        Snippet(
-                            file_path=f"cuad/{filename}",
-                            span=index_span,
-                        )
-                    )
+                if index_span is not None:
+                    spans.append(index_span)
                 else:
                     failed = True
                     break
-            snippets.sort(key=lambda x: x.span[0])
+            spans = sort_and_merge_spans(spans, max_bridge_gap_len=1)
 
-            if not failed and len(snippets) > 0:
+            if not failed and len(spans) > 0:
+                used_filenames.add(filename)
                 qa_list.append(
                     QA(
                         query=f"Consider the {generated_title}; {column_query}",
-                        snippets=snippets,
+                        snippets=[
+                            Snippet(
+                                file_path=f"cuad/{filename}",
+                                span=span,
+                            )
+                            for span in spans
+                        ],
                     )
                 )
 
@@ -297,6 +224,6 @@ async def process_cuad() -> None:
 if __name__ == "__main__":
 
     async def main() -> None:
-        await process_cuad()
+        await generate_cuad()
 
     asyncio.run(main())

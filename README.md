@@ -15,7 +15,7 @@ source .venv/bin/activate
 
 ```bash
 pip install pip-tools
-pip-sync
+pip-sync && pip install -e .
 ```
 
 3. Create your credentials.toml and set your API keys
@@ -28,5 +28,5 @@ vim ./credentials/credentials.toml
 4. Run the generate script
 
 ```bash
-python -m generate.generate_cuad
+python ./legalbenchrag/generate
 ```
