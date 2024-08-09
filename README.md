@@ -25,8 +25,8 @@ cp ./credentials/credentials.example.toml ./credentials/credentials.toml
 vim ./credentials/credentials.toml
 ```
 
-4. Run the test script
+4. Run the generate script
 
 ```bash
-python test.py
+python -m generate.generate_cuad
 ```

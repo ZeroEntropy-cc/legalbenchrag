@@ -7,4 +7,10 @@ __pycache__
 credentials/*
 !credentials/credentials.example.toml
 
+tmp
 data/cache
+data/raw_data
+
+# TODO: Use git-lfs
+data/benchmarks
+data/corpus
