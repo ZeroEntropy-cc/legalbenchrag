@@ -1,54 +1,25 @@
 import ast
 import asyncio
-import io
 import os
 import shutil
-import zipfile
 from collections.abc import Coroutine
 from typing import Any, cast
 
 import pandas as pd
-import requests
-from tqdm import tqdm
 
 from legalbenchrag.benchmark_types import QA, Benchmark, Snippet, sort_and_merge_spans
-from legalbenchrag.generate.utils import WRITE_TITLES, create_title
+from legalbenchrag.generate.utils import WRITE_TITLES, create_title, download_zip
 
 save_path = "./data/raw_data/cuad"
 
 
 def download_cuad() -> None:
-    if os.path.exists(f"{save_path}/CUAD_v1"):
-        print("CUAD dataset already exists. Skipping download.")
-        return
-
-    # Streaming download with progress bar
-    url = "https://zenodo.org/record/4595826/files/CUAD_v1.zip?download=1"
-    response = requests.get(url, stream=True)
-    total_size = int(response.headers.get("content-length", 0))
-    block_size = 4096
-
-    tqdm_bar = tqdm(total=total_size, unit="iB", unit_scale=True)
-    zip_file = io.BytesIO()
-
-    for data in response.iter_content(block_size):
-        tqdm_bar.update(len(data))
-        zip_file.write(data)
-    tqdm_bar.close()
-    zip_file.seek(0)
-
-    if total_size != 0 and tqdm_bar.n != total_size:
-        print("ERROR, something went wrong")
-
-    # Extract the contents of the zip file
-    os.makedirs(save_path, exist_ok=True)
-    with zipfile.ZipFile(zip_file, "r") as zip_ref:
-        zip_ref.extractall(save_path)
-
-    if not os.path.exists(f"{save_path}/CUAD_v1"):
-        raise RuntimeError("Download Failure! Folder not found.")
-
-    print("Download and extraction completed successfully.")
+    download_zip(
+        name="CUAD",
+        url="https://zenodo.org/record/4595826/files/CUAD_v1.zip?download=1",
+        save_path=save_path,
+        check_path="CUAD_v1",
+    )
 
 
 def filename_pdf_to_text(pdf_filename: str) -> str:

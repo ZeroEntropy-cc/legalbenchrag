@@ -1,7 +1,14 @@
+import io
+import os
+import zipfile
+
+import requests
 from pydantic import BaseModel
+from tqdm import tqdm
 
 from legalbenchrag.utils.ai import AIMessage, AIModel, ai_call
 
+# Used to manually verify title quality
 WRITE_TITLES = False
 
 TITLE_SYSTEM_PROMPT = (
@@ -94,3 +101,36 @@ async def create_title(
         response = response[:-3] + "\n}"
     title_response = TitleResponse.model_validate_json(response)
     return title_response.title
+
+
+def download_zip(name: str, url: str, save_path: str, check_path: str) -> None:
+    if os.path.exists(f"{save_path}/{check_path}"):
+        print(f"{name} dataset already exists. Skipping download.")
+        return
+
+    # Streaming download with progress bar
+    response = requests.get(url, stream=True)
+    total_size = int(response.headers.get("content-length", 0))
+    block_size = 4096
+
+    tqdm_bar = tqdm(total=total_size, unit="iB", unit_scale=True)
+    zip_file = io.BytesIO()
+
+    for data in response.iter_content(block_size):
+        tqdm_bar.update(len(data))
+        zip_file.write(data)
+    tqdm_bar.close()
+    zip_file.seek(0)
+
+    if total_size != 0 and tqdm_bar.n != total_size:
+        print("ERROR, something went wrong")
+
+    # Extract the contents of the zip file
+    os.makedirs(save_path, exist_ok=True)
+    with zipfile.ZipFile(zip_file, "r") as zip_ref:
+        zip_ref.extractall(save_path)
+
+    if not os.path.exists(f"{save_path}/{check_path}"):
+        raise RuntimeError(f"{name} Download Failure! Folder not found.")
+
+    print(f"{name} Download and extraction completed successfully.")
