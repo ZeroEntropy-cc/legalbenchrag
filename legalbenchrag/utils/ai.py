@@ -2,9 +2,9 @@ import asyncio
 import hashlib
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal, cast
 
 import anthropic
 import cohere
@@ -62,15 +62,39 @@ class AIEmbeddingModel(BaseModel):
 
     @computed_field  # type: ignore[misc]
     @property
+    def ratelimit_tpm(self) -> float:
+        match self.company:
+            case "openai":
+                return 1000000
+            case "cohere":
+                # 96 texts per embed
+                return 10000 * 96
+            case "voyageai":
+                # It says 300RPM but I can only get 30 out of it
+                return 1000000
+
+    @computed_field  # type: ignore[misc]
+    @property
     def ratelimit_rpm(self) -> float:
         match self.company:
             case "openai":
-                return 10000
+                return 5000
             case "cohere":
                 return 10000
             case "voyageai":
                 # It says 300RPM but I can only get 30 out of it
                 return 30
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def max_batch_len(self) -> int:
+        match self.company:
+            case "openai":
+                return 2048
+            case "cohere":
+                return 96
+            case "voyageai":
+                return 128
 
 
 class AIEmbeddingType(Enum):
@@ -154,14 +178,25 @@ class AITimeoutError(AIError, TimeoutError):
     """A class for AI Task Timeout Errors"""
 
 
-def ai_num_tokens(model: AIModel, s: str) -> int:
-    if model.company == "anthropic":
-        # Doesn't actually connect to the network
-        return get_ai_connection().sync_anthropic_client.count_tokens(s)
-    elif model.company == "openai":
-        encoding = tiktoken.encoding_for_model(model.model)
-        num_tokens = len(encoding.encode(s))
-        return num_tokens
+def ai_num_tokens(model: AIModel | AIEmbeddingModel | AIRerankModel, s: str) -> int:
+    if isinstance(model, AIModel):
+        if model.company == "anthropic":
+            # Doesn't actually connect to the network
+            return get_ai_connection().sync_anthropic_client.count_tokens(s)
+        elif model.company == "openai":
+            encoding = tiktoken.encoding_for_model(model.model)
+            num_tokens = len(encoding.encode(s))
+            return num_tokens
+    if isinstance(model, AIEmbeddingModel):
+        if model.company == "openai":
+            encoding = tiktoken.encoding_for_model(model.model)
+            num_tokens = len(encoding.encode(s))
+            return num_tokens
+        elif model.company == "voyageai":
+            return get_ai_connection().voyageai_client.count_tokens([s], model.model)
+    # Otherwise, estimate
+    logger.warning("Estimating Tokens!")
+    return int(len(s) / 4)
 
 
 def get_call_cache_key(
@@ -213,8 +248,8 @@ async def ai_call(
                 try:
                     # Guard with ratelimit
                     async with get_ai_connection().openai_ratelimit_semaphore:
-                        tpm = model.ratelimit_tpm
-                        expected_wait = num_tokens_input / (tpm * RATE_LIMIT_RATIO / 60)
+                        tpm = model.ratelimit_tpm * RATE_LIMIT_RATIO
+                        expected_wait = num_tokens_input / (tpm / 60)
                         await asyncio.sleep(expected_wait)
 
                     def ai_message_to_openai_message_param(
@@ -255,8 +290,8 @@ async def ai_call(
                 try:
                     # Guard with ratelimit
                     async with get_ai_connection().anthropic_ratelimit_semaphore:
-                        tpm = model.ratelimit_tpm
-                        expected_wait = num_tokens_input / (tpm * RATE_LIMIT_RATIO / 60)
+                        tpm = model.ratelimit_tpm * RATE_LIMIT_RATIO
+                        expected_wait = num_tokens_input / (tpm / 60)
                         await asyncio.sleep(expected_wait)
 
                     def ai_message_to_anthropic_message_param(
@@ -342,50 +377,106 @@ def get_embeddings_cache_key(
 
 async def ai_embedding(
     model: AIEmbeddingModel,
-    text: str,
+    texts: list[str],
     embedding_type: AIEmbeddingType,
     *,
     # Throw an AITimeoutError after this many retries fail
     num_ratelimit_retries: int = 10,
     # Backoff function (Receives index of attempt)
     backoff_algo: Callable[[int], float] = lambda i: min(2**i, 5),
-) -> list[float]:
-    cache_key = get_embeddings_cache_key(model, text, embedding_type)
-    cached_embedding = cache.get(cache_key)
+    # Callback (For tracking progress)
+    callback: Callable[[], None] = lambda: None,
+) -> list[list[float]]:
+    # Extract cache miss indices
+    text_embeddings: list[list[float] | None] = [None] * len(texts)
+    for i, text in enumerate(texts):
+        cache_key = get_embeddings_cache_key(model, text, embedding_type)
+        text_embeddings[i] = cache.get(cache_key)
+        if text_embeddings[i] is not None:
+            callback()
+    if not any(embedding is None for embedding in text_embeddings):
+        return cast(list[list[float]], text_embeddings)
+    required_text_embeddings_indices = [
+        i for i in range(len(text_embeddings)) if text_embeddings[i] is None
+    ]
 
-    if cached_embedding is not None:
-        return cached_embedding
+    # Recursively Batch if necessary
+    if len(required_text_embeddings_indices) > model.max_batch_len:
+        # Calculate embeddings in batches
+        tasks: list[Coroutine[Any, Any, list[list[float]]]] = []
+        for i in range(0, len(required_text_embeddings_indices), model.max_batch_len):
+            batch_indices = required_text_embeddings_indices[
+                i : i + model.max_batch_len
+            ]
+            tasks.append(
+                ai_embedding(
+                    model,
+                    [texts[i] for i in batch_indices],
+                    embedding_type,
+                    num_ratelimit_retries=num_ratelimit_retries,
+                    backoff_algo=backoff_algo,
+                    callback=callback,
+                )
+            )
+        preflattened_results = await asyncio.gather(*tasks)
+        results: list[list[float]] = []
+        for embeddings_list in preflattened_results:
+            results.extend(embeddings_list)
+        # Merge with cache hits
+        assert len(required_text_embeddings_indices) == len(results)
+        for i, embedding in zip(required_text_embeddings_indices, results):
+            text_embeddings[i] = embedding
+        assert all(embedding is not None for embedding in text_embeddings)
+        return cast(list[list[float]], text_embeddings)
 
-    embedding: list[float] | None = None
+    num_tokens_input: int = sum(
+        [
+            ai_num_tokens(model, texts[index])
+            for index in required_text_embeddings_indices
+        ]
+    )
+
+    input_texts = [texts[i] for i in required_text_embeddings_indices]
+    text_embeddings_response: list[list[float]] | None = None
     match model.company:
         case "openai":
             for i in range(num_ratelimit_retries):
                 try:
                     async with get_ai_connection().openai_ratelimit_semaphore:
                         rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
-                        await asyncio.sleep(60.0 / rpm)
+                        tpm = model.ratelimit_tpm * RATE_LIMIT_RATIO
+                        expected_wait = max(60.0 / rpm, num_tokens_input / (tpm / 60))
+                        await asyncio.sleep(expected_wait)
                     response = (
                         await get_ai_connection().openai_client.embeddings.create(
-                            input=[text],
+                            input=input_texts,
                             model=model.model,
                         )
                     )
-                    embedding = response.data[0].embedding
+                    text_embeddings_response = [
+                        embedding.embedding for embedding in response.data
+                    ]
                     break
-                except openai.RateLimitError:
+                except (
+                    openai.RateLimitError,
+                    openai.APIConnectionError,
+                    openai.APITimeoutError,
+                ):
                     logger.warning("OpenAI RateLimitError")
                     async with get_ai_connection().openai_ratelimit_semaphore:
                         await asyncio.sleep(backoff_algo(i))
-            if embedding is None:
+            if text_embeddings_response is None:
                 raise AITimeoutError("Cannot overcome OpenAI RateLimitError")
         case "cohere":
             for i in range(num_ratelimit_retries):
                 try:
                     async with get_ai_connection().cohere_ratelimit_semaphore:
                         rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
-                        await asyncio.sleep(60.0 / rpm)
+                        tpm = model.ratelimit_tpm * RATE_LIMIT_RATIO
+                        expected_wait = max(60.0 / rpm, num_tokens_input / (tpm / 60))
+                        await asyncio.sleep(expected_wait)
                     result = await get_ai_connection().cohere_client.embed(
-                        texts=[text],
+                        texts=input_texts,
                         model=model.model,
                         input_type=(
                             "search_document"
@@ -394,22 +485,24 @@ async def ai_embedding(
                         ),
                     )
                     assert isinstance(result.embeddings, list)
-                    embedding = result.embeddings[0]
+                    text_embeddings_response = result.embeddings
                     break
                 except voyageai.error.RateLimitError:
                     logger.warning("Cohere RateLimitError")
                     async with get_ai_connection().cohere_ratelimit_semaphore:
                         await asyncio.sleep(backoff_algo(i))
-            if embedding is None:
+            if text_embeddings_response is None:
                 raise AITimeoutError("Cannot overcome Cohere RateLimitError")
         case "voyageai":
             for i in range(num_ratelimit_retries):
                 try:
                     async with get_ai_connection().voyageai_ratelimit_semaphore:
                         rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
-                        await asyncio.sleep(60.0 / rpm)
+                        tpm = model.ratelimit_tpm * RATE_LIMIT_RATIO
+                        expected_wait = max(60.0 / rpm, num_tokens_input / (tpm / 60))
+                        await asyncio.sleep(expected_wait)
                     result = await get_ai_connection().voyageai_client.embed(
-                        [text],
+                        input_texts,
                         model=model.model,
                         input_type=(
                             "document"
@@ -418,16 +511,25 @@ async def ai_embedding(
                         ),
                     )
                     assert isinstance(result.embeddings, list)
-                    embedding = result.embeddings[0]
+                    text_embeddings_response = result.embeddings
                     break
                 except voyageai.error.RateLimitError:
                     logger.warning("VoyageAI RateLimitError")
                     async with get_ai_connection().voyageai_ratelimit_semaphore:
                         await asyncio.sleep(backoff_algo(i))
-            if embedding is None:
+            if text_embeddings_response is None:
                 raise AITimeoutError("Cannot overcome VoyageAI RateLimitError")
-    cache.set(cache_key, embedding)
-    return embedding
+
+    assert len(text_embeddings_response) == len(required_text_embeddings_indices)
+    for index, embedding in zip(
+        required_text_embeddings_indices, text_embeddings_response
+    ):
+        cache_key = get_embeddings_cache_key(model, texts[index], embedding_type)
+        cache.set(cache_key, embedding)
+        text_embeddings[index] = embedding
+        callback()
+    assert all(embedding is not None for embedding in text_embeddings)
+    return cast(list[list[float]], text_embeddings)
 
 
 def get_rerank_cache_key(
@@ -479,7 +581,11 @@ async def ai_rerank(
                     )
                     indices = [result.index for result in response.results]
                     break
-                except (cohere.errors.TooManyRequestsError, httpx.ConnectError):
+                except (
+                    cohere.errors.TooManyRequestsError,
+                    httpx.ConnectError,
+                    httpx.RemoteProtocolError,
+                ):
                     logger.warning("Cohere RateLimitError")
                     async with get_ai_connection().cohere_ratelimit_semaphore:
                         await asyncio.sleep(backoff_algo(i))

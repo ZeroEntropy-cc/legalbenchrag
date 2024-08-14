@@ -177,6 +177,8 @@ sniffio==1.3.1
     #   openai
 sqlalchemy==2.0.32
     # via langchain
+sqlite-vec==0.1.1
+    # via -r requirements.in
 tenacity==8.5.0
     # via
     #   langchain

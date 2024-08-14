@@ -99,3 +99,8 @@ class RetrievalMethod(ABC):
     async def query(self, query: str) -> QueryResponse:
         """Run the retrieval method on the given dataset."""
         ...
+
+    @abstractmethod
+    async def cleanup(self) -> None:
+        """Cleanup any resources."""
+        ...

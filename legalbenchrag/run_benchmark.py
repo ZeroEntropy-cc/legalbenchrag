@@ -2,7 +2,8 @@ import asyncio
 from collections.abc import Coroutine
 from typing import Any
 
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, computed_field, model_validator
+from typing_extensions import Self
 
 from legalbenchrag.benchmark_types import (
     Document,
@@ -61,22 +62,43 @@ def avg(arr: list[float]) -> float:
 
 class BenchmarkResult(BaseModel):
     qa_result_list: list[QAResult]
+    weights: list[float]
 
     @computed_field  # type: ignore[misc]
     @property
     def avg_precision(self) -> float:
-        return avg([qa_result.precision for qa_result in self.qa_result_list])
+        avg_weight = avg(self.weights)
+        return avg(
+            [
+                qa_result.precision * weight / avg_weight
+                for qa_result, weight in zip(self.qa_result_list, self.weights)
+            ]
+        )
 
     @computed_field  # type: ignore[misc]
     @property
     def avg_recall(self) -> float:
-        return avg([qa_result.recall for qa_result in self.qa_result_list])
+        avg_weight = avg(self.weights)
+        return avg(
+            [
+                qa_result.recall * weight / avg_weight
+                for qa_result, weight in zip(self.qa_result_list, self.weights)
+            ]
+        )
+
+    @model_validator(mode="after")
+    def validate_lengths(self) -> Self:
+        if len(self.qa_result_list) != len(self.weights):
+            raise ValueError("length of qa_result_list and weights do not match!")
+        return self
 
 
 async def run_benchmark(
     qa_gt_list: list[QAGroundTruth],
     corpus: list[Document],
     retrieval_method: RetrievalMethod,
+    *,
+    weights: list[float] | None = None,
 ) -> BenchmarkResult:
     # Process the documents
     for document in corpus:
@@ -95,4 +117,9 @@ async def run_benchmark(
     ]
     results = await asyncio.gather(*tasks)
 
-    return BenchmarkResult(qa_result_list=results)
+    await retrieval_method.cleanup()
+
+    return BenchmarkResult(
+        qa_result_list=results,
+        weights=weights if weights is not None else [1.0] * len(results),
+    )

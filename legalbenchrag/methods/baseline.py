@@ -1,10 +1,12 @@
-import asyncio
+import os
+import sqlite3
+import struct
 from typing import cast
 
-import faiss  # type: ignore
-import numpy as np
+import sqlite_vec  # type: ignore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
+from tqdm import tqdm
 
 from legalbenchrag.benchmark_types import (
     Document,
@@ -21,6 +23,14 @@ from legalbenchrag.utils.ai import (
 )
 
 
+def serialize_f32(vector: list[float]) -> bytes:
+    """serializes a list of floats into a compact "raw bytes" format"""
+    return struct.pack(f"{len(vector)}f", *vector)
+
+
+SHOW_LOADING_BAR = True
+
+
 class RetrievalStrategy(BaseModel):
     name: str
     embedding_model: AIEmbeddingModel
@@ -33,26 +43,43 @@ class RetrievalStrategy(BaseModel):
 class EmbeddingInfo(BaseModel):
     document_id: str
     span: tuple[int, int]
-    embedding: list[float]
 
 
 class BaselineRetrievalMethod(RetrievalMethod):
     retrieval_strategy: RetrievalStrategy
     documents: dict[str, Document]
     embedding_infos: list[EmbeddingInfo] | None
-    faiss_index: faiss.IndexFlatL2 | None
+    sqlite_db: sqlite3.Connection | None
+    sqlite_db_file_path: str | None
 
     def __init__(self, retrieval_strategy: RetrievalStrategy):
         self.retrieval_strategy = retrieval_strategy
         self.documents = {}
         self.embedding_infos = None
-        self.faiss_index = None
+        self.sqlite_db = None
+        self.sqlite_db_file_path = None
+
+    async def cleanup(self) -> None:
+        if self.sqlite_db is not None:
+            self.sqlite_db.close()
+            self.sqlite_db = None
+        if self.sqlite_db_file_path is not None and os.path.exists(
+            self.sqlite_db_file_path
+        ):
+            os.remove(self.sqlite_db_file_path)
+            self.sqlite_db_file_path = None
 
     async def ingest_document(self, document: Document) -> None:
         self.documents[document.file_path] = document
 
     async def sync_all_documents(self) -> None:
-        embedding_infos: list[EmbeddingInfo] = []
+        class Chunk(BaseModel):
+            document_id: str
+            span: tuple[int, int]
+            content: str
+
+        # Calculate chunks
+        chunks: list[Chunk] = []
         for document_id, document in self.documents.items():
             # Get chunks
             synthetic_data_splitter = RecursiveCharacterTextSplitter(
@@ -63,60 +90,103 @@ class BaselineRetrievalMethod(RetrievalMethod):
                 is_separator_regex=False,
                 strip_whitespace=False,
             )
-            chunks = synthetic_data_splitter.split_text(document.content)
-            assert sum(len(chunk) for chunk in chunks) == len(document.content)
+            text_splits = synthetic_data_splitter.split_text(document.content)
+            assert sum(len(text_split) for text_split in text_splits) == len(
+                document.content
+            )
+            assert "".join(text_splits) == document.content
 
             # Get spans from chunks
-            spans: list[tuple[int, int]] = []
-            for chunk in chunks:
-                prev_index = spans[-1][1] if len(spans) > 0 else 0
-                spans.append((prev_index, prev_index + len(chunk)))
-
-            # Calculate embeddings
-            embeddings = await asyncio.gather(
-                *[
-                    ai_embedding(
-                        self.retrieval_strategy.embedding_model,
-                        chunk,
-                        AIEmbeddingType.DOCUMENT,
-                    )
-                    for chunk in chunks
-                ]
-            )
-
-            # Store the embedding infos
-            assert len(spans) == len(embeddings)
-            for span, embedding in zip(spans, embeddings):
-                embedding_infos.append(
-                    EmbeddingInfo(
+            prev_span: tuple[int, int] | None = None
+            for text_split in text_splits:
+                prev_index = prev_span[1] if prev_span is not None else 0
+                span = (prev_index, prev_index + len(text_split))
+                chunks.append(
+                    Chunk(
                         document_id=document_id,
                         span=span,
-                        embedding=embedding,
+                        content=text_split,
                     )
                 )
+                prev_span = span
 
-        # Create a FAISS index over all embedding infos
-        all_embeddings = [
-            embedding_info.embedding for embedding_info in embedding_infos
-        ]
-        dimension = len(all_embeddings[0])
-        self.embedding_infos = embedding_infos
-        self.faiss_index = faiss.IndexFlatL2(dimension)
-        self.faiss_index.add(np.array(all_embeddings).astype("float32"))
+        # Calculate embeddings
+        progress_bar: tqdm | None = None
+        if SHOW_LOADING_BAR:
+            progress_bar = tqdm(total=len(chunks), desc="Processing", ncols=100)
+
+        EMBEDDING_BATCH_SIZE = 2048
+        self.embedding_infos = []
+        for i in range(0, len(chunks), EMBEDDING_BATCH_SIZE):
+            chunk_batch = chunks[i : i + EMBEDDING_BATCH_SIZE]
+            assert len(chunk_batch) > 0
+            embeddings = await ai_embedding(
+                self.retrieval_strategy.embedding_model,
+                [chunk.content for chunk in chunk_batch],
+                AIEmbeddingType.DOCUMENT,
+                callback=lambda: (progress_bar.update(1), None)[1]
+                if progress_bar
+                else None,
+            )
+            assert len(chunk_batch) == len(embeddings)
+            # Save the Info
+            if self.sqlite_db is None:
+                # random_id = str(uuid4())
+                self.sqlite_db_file_path = "./data/cache/baseline.db"
+                if os.path.exists(self.sqlite_db_file_path):
+                    os.remove(self.sqlite_db_file_path)
+                self.sqlite_db = sqlite3.connect(self.sqlite_db_file_path)
+                self.sqlite_db.enable_load_extension(True)
+                sqlite_vec.load(self.sqlite_db)
+                self.sqlite_db.enable_load_extension(False)
+                # Set RAM Usage and create vector table
+                self.sqlite_db.execute(f"PRAGMA mmap_size = {3*1024*1024*1024}")
+                self.sqlite_db.execute(
+                    f"CREATE VIRTUAL TABLE vec_items USING vec0(embedding float[{len(embeddings[0])}])"
+                )
+
+            with self.sqlite_db as db:
+                insert_data = [
+                    (len(self.embedding_infos) + i, serialize_f32(embedding))
+                    for i, embedding in enumerate(embeddings)
+                ]
+                db.executemany(
+                    "INSERT INTO vec_items(rowid, embedding) VALUES (?, ?)",
+                    insert_data,
+                )
+                for chunk, embedding in zip(chunk_batch, embeddings):
+                    self.embedding_infos.append(
+                        EmbeddingInfo(
+                            document_id=chunk.document_id,
+                            span=chunk.span,
+                            embedding=embedding,
+                        )
+                    )
+        if progress_bar:
+            progress_bar.close()
 
     async def query(self, query: str) -> QueryResponse:
-        if self.faiss_index is None or self.embedding_infos is None:
+        if self.sqlite_db is None or self.embedding_infos is None:
             raise ValueError("Sync documents before querying!")
         # Get TopK Embedding results
-        query_embedding = await ai_embedding(
-            self.retrieval_strategy.embedding_model, query, AIEmbeddingType.QUERY
-        )
-        _, faiss_indices = self.faiss_index.search(
-            np.array([query_embedding]).astype("float32"),
-            self.retrieval_strategy.embedding_topk,
-        )
-        faiss_indices = cast(list[list[int]], [a.tolist() for a in faiss_indices])
-        indices = [index for index in faiss_indices[0] if index >= 0]
+        query_embedding = (
+            await ai_embedding(
+                self.retrieval_strategy.embedding_model, [query], AIEmbeddingType.QUERY
+            )
+        )[0]
+        rows = self.sqlite_db.execute(
+            """
+            SELECT
+                rowid,
+                distance
+            FROM vec_items
+            WHERE embedding MATCH ?
+            ORDER BY distance ASC
+            LIMIT ?
+            """,
+            [serialize_f32(query_embedding), self.retrieval_strategy.embedding_topk],
+        ).fetchall()
+        indices = [cast(int, row[0]) for row in rows]
         retrieved_embedding_infos = [self.embedding_infos[i] for i in indices]
 
         # Rerank
