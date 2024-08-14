@@ -10,6 +10,7 @@ credentials/*
 tmp
 data/cache
 data/raw_data
+benchmark_results
 
 # TODO: Think about .egg-info at a later time
 LegalBenchRAG.egg-info

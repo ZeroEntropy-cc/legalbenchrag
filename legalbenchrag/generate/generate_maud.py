@@ -11,7 +11,12 @@ import pandas as pd
 from pydantic import BaseModel
 from unidecode import unidecode
 
-from legalbenchrag.benchmark_types import QA, Benchmark, Snippet, sort_and_merge_spans
+from legalbenchrag.benchmark_types import (
+    Benchmark,
+    QAGroundTruth,
+    Snippet,
+    sort_and_merge_spans,
+)
 from legalbenchrag.generate.utils import WRITE_TITLES, create_title, download_zip
 
 """
@@ -149,7 +154,7 @@ async def generate_maud() -> None:
     # Mapping from contract name to filename,
     # Only for the ones that we've used.
     used_contract_name_to_filename: dict[str, str] = {}
-    qa_list: list[QA] = []
+    qa_list: list[QAGroundTruth] = []
     failures = 0
     successes = 0
     column_name_to_qty = {}
@@ -288,7 +293,7 @@ async def generate_maud() -> None:
                 assert used_contract_name_to_filename[contract_name] == filename
             used_contract_name_to_filename[contract_name] = filename
             qa_list.append(
-                QA(
+                QAGroundTruth(
                     query=f"Consider the {row_info.title}; {query}",
                     snippets=[
                         Snippet(

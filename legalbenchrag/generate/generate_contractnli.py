@@ -5,7 +5,12 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from legalbenchrag.benchmark_types import QA, Benchmark, Snippet, sort_and_merge_spans
+from legalbenchrag.benchmark_types import (
+    Benchmark,
+    QAGroundTruth,
+    Snippet,
+    sort_and_merge_spans,
+)
 from legalbenchrag.generate.utils import WRITE_TITLES, create_title, download_zip
 
 save_path = "./data/raw_data/contractnli"
@@ -79,7 +84,7 @@ async def generate_contractnli() -> None:
     corpus_dir = "./data/corpus/contractnli"
     os.makedirs(corpus_dir, exist_ok=True)
     used_filename_to_text: dict[str, str] = {}
-    qa_list: list[QA] = []
+    qa_list: list[QAGroundTruth] = []
 
     dataset_json = get_dataset_json()
     for document in dataset_json.documents:
@@ -95,7 +100,7 @@ async def generate_contractnli() -> None:
                     continue
                 used_filename_to_text[filename] = document.text
                 qa_list.append(
-                    QA(
+                    QAGroundTruth(
                         query=label_mapping[annotation_label],
                         snippets=[
                             Snippet(

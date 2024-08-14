@@ -7,7 +7,12 @@ from typing import Any, cast
 
 import pandas as pd
 
-from legalbenchrag.benchmark_types import QA, Benchmark, Snippet, sort_and_merge_spans
+from legalbenchrag.benchmark_types import (
+    Benchmark,
+    QAGroundTruth,
+    Snippet,
+    sort_and_merge_spans,
+)
 from legalbenchrag.generate.utils import WRITE_TITLES, create_title, download_zip
 
 save_path = "./data/raw_data/cuad"
@@ -133,7 +138,7 @@ async def generate_cuad() -> None:
         "Third Party Beneficiary": "Are there any third-party beneficiaries designated in this contract?",
     }
 
-    qa_list: list[QA] = []
+    qa_list: list[QAGroundTruth] = []
     used_filenames: set[str] = set()
 
     for i, generated_title in filtered_extracted_rows:
@@ -166,7 +171,7 @@ async def generate_cuad() -> None:
             if not failed and len(spans) > 0:
                 used_filenames.add(filename)
                 qa_list.append(
-                    QA(
+                    QAGroundTruth(
                         query=f"Consider the {generated_title}; {column_query}",
                         snippets=[
                             Snippet(

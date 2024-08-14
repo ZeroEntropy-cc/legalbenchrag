@@ -5,7 +5,12 @@ from typing import cast
 import pandas as pd
 from pydantic import BaseModel
 
-from legalbenchrag.benchmark_types import QA, Benchmark, Snippet, sort_and_merge_spans
+from legalbenchrag.benchmark_types import (
+    Benchmark,
+    QAGroundTruth,
+    Snippet,
+    sort_and_merge_spans,
+)
 from legalbenchrag.generate.utils import download_zip
 
 save_path = "./data/raw_data/privacy_qa"
@@ -103,7 +108,7 @@ async def generate_privacy_qa() -> None:
 
     # Create the qa_list
     used_doc_ids: set[str] = set()
-    qa_list: list[QA] = []
+    qa_list: list[QAGroundTruth] = []
     for (doc_id, query_id), annotations in doc_id_and_query_id_to_annotations.items():
         # Skip if any annotations had too many none's
         if any(annotation.no_responses > 2 for annotation in annotations):
@@ -135,7 +140,7 @@ async def generate_privacy_qa() -> None:
         # Store the QA
         used_doc_ids.add(doc_id)
         qa_list.append(
-            QA(
+            QAGroundTruth(
                 query=f'Consider "{doc_id}"\'s privacy policy; {doc_id_and_query_id_to_question[(doc_id, query_id)]}',
                 snippets=[
                     Snippet(

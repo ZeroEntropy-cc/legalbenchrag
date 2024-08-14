@@ -2,13 +2,14 @@ import asyncio
 import hashlib
 import logging
 import os
+from collections.abc import Callable
 from enum import Enum
 from typing import Literal
-from uuid import UUID, uuid4
 
 import anthropic
 import cohere
 import diskcache as dc  # type: ignore
+import httpx
 import openai
 import tiktoken
 import voyageai  # type: ignore
@@ -17,14 +18,86 @@ from anthropic import NOT_GIVEN, Anthropic, AsyncAnthropic, NotGiven
 from anthropic.types import MessageParam
 from openai import AsyncOpenAI, RateLimitError
 from openai.types.chat import ChatCompletionMessageParam
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, computed_field
 
 from legalbenchrag.utils.credentials import credentials
 
 logger = logging.getLogger("uvicorn")
 
+# AI Types
+
+
+class AIModel(BaseModel):
+    company: Literal["openai", "anthropic"]
+    model: str
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def ratelimit_tpm(self) -> float:
+        match self.company:
+            case "openai":
+                # Tier 5
+                match self.model:
+                    case "gpt-4o-mini":
+                        return 150000000
+                    case "gpt-4o":
+                        return 30000000
+                    case m if m.startswith("gpt-4-turbo"):
+                        return 2000000
+                    case _:
+                        return 1000000
+            case "anthropic":
+                # Tier 4
+                return 400000
+
+
+class AIMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class AIEmbeddingModel(BaseModel):
+    company: Literal["openai", "cohere", "voyageai"]
+    model: str
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def ratelimit_rpm(self) -> float:
+        match self.company:
+            case "openai":
+                return 10000
+            case "cohere":
+                return 10000
+            case "voyageai":
+                # It says 300RPM but I can only get 30 out of it
+                return 30
+
+
+class AIEmbeddingType(Enum):
+    DOCUMENT = 1
+    QUERY = 2
+
+
+class AIRerankModel(BaseModel):
+    company: Literal["cohere", "voyageai"]
+    model: str
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def ratelimit_rpm(self) -> float:
+        match self.company:
+            case "cohere":
+                return 10000
+            case "voyageai":
+                # It says 100RPM but I can only get 60 out of it
+                return 60
+
+
+# Cache
 os.makedirs("./data/cache", exist_ok=True)
-cache = dc.Cache("./data/cache/diskcache")
+cache = dc.Cache("./data/cache/ai_cache.db")
+
+RATE_LIMIT_RATIO = 0.95
 
 
 class AIConnection:
@@ -69,26 +142,16 @@ def get_ai_connection() -> AIConnection:
     return ai_connections[event_loop]
 
 
-class TaskOutput(BaseModel):
-    id: UUID = Field(default_factory=lambda: uuid4())
-
-
-class AIModel(BaseModel):
-    company: Literal["openai", "anthropic"]
-    model: str
-
-
-class AIMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
-
-
 class AIError(Exception):
-    """A class for GPT Task Errors"""
+    """A class for AI Task Errors"""
 
 
-class AIModerationError(AIError):
-    pass
+class AIValueError(AIError, ValueError):
+    """A class for AI Value Errors"""
+
+
+class AITimeoutError(AIError, TimeoutError):
+    """A class for AI Task Timeout Errors"""
 
 
 def ai_num_tokens(model: AIModel, s: str) -> int:
@@ -122,13 +185,16 @@ async def ai_call(
     *,
     max_tokens: int = 4096,
     temperature: float = 0.0,
-    num_ratelimit_retries: int = 10,
     # When using anthropic, the first message must be from the user.
     # If the first message is not a User, this message will be prepended to the messages.
     anthropic_initial_message: str | None = "<START>",
     # If two messages of the same role are given to anthropic, they must be concatenated.
     # This is the delimiter between concatenated.
     anthropic_combine_delimiter: str = "\n",
+    # Throw an AITimeoutError after this many retries fail
+    num_ratelimit_retries: int = 10,
+    # Backoff function (Receives index of attempt)
+    backoff_algo: Callable[[int], float] = lambda i: min(2**i, 5),
 ) -> str:
     cache_key = get_call_cache_key(model, messages)
     cached_call = cache.get(cache_key)
@@ -147,9 +213,8 @@ async def ai_call(
                 try:
                     # Guard with ratelimit
                     async with get_ai_connection().openai_ratelimit_semaphore:
-                        tpm = 2000000
-                        ratio = 0.95
-                        expected_wait = num_tokens_input / (tpm * ratio / 60)
+                        tpm = model.ratelimit_tpm
+                        expected_wait = num_tokens_input / (tpm * RATE_LIMIT_RATIO / 60)
                         await asyncio.sleep(expected_wait)
 
                     def ai_message_to_openai_message_param(
@@ -175,25 +240,23 @@ async def ai_call(
                             max_tokens=max_tokens,
                         )
                     )
-                    if response.choices[0].message.content is None:
-                        raise RuntimeError("OpenAI returned nothing")
+                    assert response.choices[0].message.content is not None
                     return_value = response.choices[0].message.content
                     break
                 except RateLimitError:
                     logger.warning("OpenAI RateLimitError")
                     async with get_ai_connection().openai_ratelimit_semaphore:
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(backoff_algo(i))
             if return_value is None:
-                raise TimeoutError("Cannot overcome OpenAI RateLimitError")
+                raise AITimeoutError("Cannot overcome OpenAI RateLimitError")
 
         case "anthropic":
             for i in range(num_ratelimit_retries):
                 try:
                     # Guard with ratelimit
                     async with get_ai_connection().anthropic_ratelimit_semaphore:
-                        tpm = 400000
-                        ratio = 0.95
-                        expected_wait = num_tokens_input / (tpm * ratio / 60)
+                        tpm = model.ratelimit_tpm
+                        expected_wait = num_tokens_input / (tpm * RATE_LIMIT_RATIO / 60)
                         await asyncio.sleep(expected_wait)
 
                     def ai_message_to_anthropic_message_param(
@@ -202,7 +265,7 @@ async def ai_call(
                         if message.role == "user" or message.role == "assistant":
                             return {"role": message.role, "content": message.content}
                         elif message.role == "system":
-                            raise RuntimeError(
+                            raise AIValueError(
                                 "system not allowed in anthropic message param"
                             )
 
@@ -262,22 +325,12 @@ async def ai_call(
                 except anthropic.RateLimitError as e:
                     logger.warning(f"Anthropic Error: {repr(e)}")
                     async with get_ai_connection().anthropic_ratelimit_semaphore:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(backoff_algo(i))
             if return_value is None:
-                raise TimeoutError("Cannot overcome Anthropic RateLimitError")
+                raise AITimeoutError("Cannot overcome Anthropic RateLimitError")
 
     cache.set(cache_key, return_value)
     return return_value
-
-
-class AIEmbeddingModel(BaseModel):
-    company: Literal["openai", "cohere", "voyageai"]
-    model: str
-
-
-class AIEmbeddingType(Enum):
-    DOCUMENT = 1
-    QUERY = 2
 
 
 def get_embeddings_cache_key(
@@ -288,7 +341,14 @@ def get_embeddings_cache_key(
 
 
 async def ai_embedding(
-    model: AIEmbeddingModel, text: str, embedding_type: AIEmbeddingType
+    model: AIEmbeddingModel,
+    text: str,
+    embedding_type: AIEmbeddingType,
+    *,
+    # Throw an AITimeoutError after this many retries fail
+    num_ratelimit_retries: int = 10,
+    # Backoff function (Receives index of attempt)
+    backoff_algo: Callable[[int], float] = lambda i: min(2**i, 5),
 ) -> list[float]:
     cache_key = get_embeddings_cache_key(model, text, embedding_type)
     cached_embedding = cache.get(cache_key)
@@ -299,8 +359,11 @@ async def ai_embedding(
     embedding: list[float] | None = None
     match model.company:
         case "openai":
-            for _ in range(10):
+            for i in range(num_ratelimit_retries):
                 try:
+                    async with get_ai_connection().openai_ratelimit_semaphore:
+                        rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
+                        await asyncio.sleep(60.0 / rpm)
                     response = (
                         await get_ai_connection().openai_client.embeddings.create(
                             input=[text],
@@ -312,12 +375,15 @@ async def ai_embedding(
                 except openai.RateLimitError:
                     logger.warning("OpenAI RateLimitError")
                     async with get_ai_connection().openai_ratelimit_semaphore:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(backoff_algo(i))
             if embedding is None:
-                raise TimeoutError("Cannot overcome OpenAI RateLimitError")
+                raise AITimeoutError("Cannot overcome OpenAI RateLimitError")
         case "cohere":
-            for _ in range(10):
+            for i in range(num_ratelimit_retries):
                 try:
+                    async with get_ai_connection().cohere_ratelimit_semaphore:
+                        rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
+                        await asyncio.sleep(60.0 / rpm)
                     result = await get_ai_connection().cohere_client.embed(
                         texts=[text],
                         model=model.model,
@@ -333,14 +399,15 @@ async def ai_embedding(
                 except voyageai.error.RateLimitError:
                     logger.warning("Cohere RateLimitError")
                     async with get_ai_connection().cohere_ratelimit_semaphore:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(backoff_algo(i))
             if embedding is None:
-                raise TimeoutError("Cannot overcome Cohere RateLimitError")
+                raise AITimeoutError("Cannot overcome Cohere RateLimitError")
         case "voyageai":
-            for _ in range(10):
+            for i in range(num_ratelimit_retries):
                 try:
                     async with get_ai_connection().voyageai_ratelimit_semaphore:
-                        await asyncio.sleep(60 / 90)
+                        rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
+                        await asyncio.sleep(60.0 / rpm)
                     result = await get_ai_connection().voyageai_client.embed(
                         [text],
                         model=model.model,
@@ -356,16 +423,11 @@ async def ai_embedding(
                 except voyageai.error.RateLimitError:
                     logger.warning("VoyageAI RateLimitError")
                     async with get_ai_connection().voyageai_ratelimit_semaphore:
-                        await asyncio.sleep(10)
+                        await asyncio.sleep(backoff_algo(i))
             if embedding is None:
-                raise TimeoutError("Cannot overcome VoyageAI RateLimitError")
+                raise AITimeoutError("Cannot overcome VoyageAI RateLimitError")
     cache.set(cache_key, embedding)
     return embedding
-
-
-class AIRerankModel(BaseModel):
-    company: Literal["cohere", "voyageai"]
-    model: str
 
 
 def get_rerank_cache_key(
@@ -385,7 +447,15 @@ def get_rerank_cache_key(
 
 # Gets the list of indices that reranks the original texts
 async def ai_rerank(
-    model: AIRerankModel, query: str, texts: list[str], *, top_k: int | None = None
+    model: AIRerankModel,
+    query: str,
+    texts: list[str],
+    *,
+    top_k: int | None = None,
+    # Throw an AITimeoutError after this many retries fail
+    num_ratelimit_retries: int = 10,
+    # Backoff function (Receives index of attempt)
+    backoff_algo: Callable[[int], float] = lambda i: min(2**i, 5),
 ) -> list[int]:
     cache_key = get_rerank_cache_key(model, query, texts, top_k)
     cached_reranking = cache.get(cache_key)
@@ -396,10 +466,11 @@ async def ai_rerank(
     indices: list[int] | None = None
     match model.company:
         case "cohere":
-            for _ in range(10):
+            for i in range(num_ratelimit_retries):
                 try:
                     async with get_ai_connection().cohere_ratelimit_semaphore:
-                        await asyncio.sleep(0.1)
+                        rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
+                        await asyncio.sleep(60.0 / rpm)
                     response = await get_ai_connection().cohere_client.rerank(
                         model=model.model,
                         query=query,
@@ -408,17 +479,18 @@ async def ai_rerank(
                     )
                     indices = [result.index for result in response.results]
                     break
-                except cohere.errors.TooManyRequestsError:
+                except (cohere.errors.TooManyRequestsError, httpx.ConnectError):
                     logger.warning("Cohere RateLimitError")
                     async with get_ai_connection().cohere_ratelimit_semaphore:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(backoff_algo(i))
             if indices is None:
-                raise TimeoutError("Cannot overcome Cohere RateLimitError")
+                raise AITimeoutError("Cannot overcome Cohere RateLimitError")
         case "voyageai":
-            for _ in range(10):
+            for i in range(num_ratelimit_retries):
                 try:
                     async with get_ai_connection().voyageai_ratelimit_semaphore:
-                        await asyncio.sleep(1)
+                        rpm = model.ratelimit_rpm * RATE_LIMIT_RATIO
+                        await asyncio.sleep(60.0 / rpm)
                     voyageai_response = (
                         await get_ai_connection().voyageai_client.rerank(
                             query=query,
@@ -434,8 +506,8 @@ async def ai_rerank(
                 except voyageai.error.RateLimitError:
                     logger.warning("VoyageAI RateLimitError")
                     async with get_ai_connection().voyageai_ratelimit_semaphore:
-                        await asyncio.sleep(30)
+                        await asyncio.sleep(backoff_algo(i))
             if indices is None:
-                raise TimeoutError("Cannot overcome VoyageAI RateLimitError")
+                raise AITimeoutError("Cannot overcome VoyageAI RateLimitError")
     cache.set(cache_key, indices)
     return indices
