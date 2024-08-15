@@ -64,27 +64,41 @@ class BenchmarkResult(BaseModel):
     qa_result_list: list[QAResult]
     weights: list[float]
 
-    @computed_field  # type: ignore[misc]
-    @property
-    def avg_precision(self) -> float:
-        avg_weight = avg(self.weights)
-        return avg(
-            [
-                qa_result.precision * weight / avg_weight
-                for qa_result, weight in zip(self.qa_result_list, self.weights)
-            ]
+    def get_avg_recall_and_precision(
+        self, tag_filter: str | None = None
+    ) -> tuple[float, float]:
+        indices = [
+            i
+            for i, qa_result in enumerate(self.qa_result_list)
+            if (tag_filter is None or tag_filter in qa_result.qa_gt.tags)
+        ]
+        filtered_qa_results = [self.qa_result_list[i] for i in indices]
+        filtered_weights = [self.weights[i] for i in indices]
+        avg_weight = avg(filtered_weights)
+        return (
+            avg(
+                [
+                    qa_result.recall * weight / avg_weight
+                    for qa_result, weight in zip(filtered_qa_results, filtered_weights)
+                ]
+            ),
+            avg(
+                [
+                    qa_result.precision * weight / avg_weight
+                    for qa_result, weight in zip(filtered_qa_results, filtered_weights)
+                ]
+            ),
         )
 
     @computed_field  # type: ignore[misc]
     @property
+    def avg_precision(self) -> float:
+        return self.get_avg_recall_and_precision()[1]
+
+    @computed_field  # type: ignore[misc]
+    @property
     def avg_recall(self) -> float:
-        avg_weight = avg(self.weights)
-        return avg(
-            [
-                qa_result.recall * weight / avg_weight
-                for qa_result, weight in zip(self.qa_result_list, self.weights)
-            ]
-        )
+        return self.get_avg_recall_and_precision()[0]
 
     @model_validator(mode="after")
     def validate_lengths(self) -> Self:

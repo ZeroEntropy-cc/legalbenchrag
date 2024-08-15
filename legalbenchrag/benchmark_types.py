@@ -52,6 +52,7 @@ def validate_snippet_list(snippets: Sequence[Snippet]) -> None:
 class QAGroundTruth(BaseModel):
     query: str
     snippets: list[Snippet]
+    tags: list[str] = []
 
     @model_validator(mode="after")
     def validate_snippet_spans(self) -> Self:

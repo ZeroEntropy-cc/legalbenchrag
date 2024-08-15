@@ -3,10 +3,12 @@ import datetime as dt
 import os
 import random
 
+import pandas as pd
+
 from legalbenchrag.benchmark_types import Benchmark, Document, QAGroundTruth
-from legalbenchrag.methods.baseline import BaselineRetrievalMethod, RetrievalStrategy
+from legalbenchrag.methods.baseline import BaselineRetrievalMethod
+from legalbenchrag.methods.retrieval_strategies import RETRIEVAL_STRATEGIES
 from legalbenchrag.run_benchmark import run_benchmark
-from legalbenchrag.utils.ai import AIEmbeddingModel
 
 benchmark_name_to_weight: dict[str, float] = {
     "privacy_qa": 0.25,
@@ -56,25 +58,12 @@ async def main() -> None:
             used_document_file_paths_set |= {
                 snippet.file_path for test in tests for snippet in test.snippets
             }
+            for test in tests:
+                test.tags = [benchmark_name]
             all_tests.extend(tests)
             weights.extend([weight / len(tests)] * len(tests))
     benchmark = Benchmark(
         tests=all_tests,
-    )
-
-    retrieval_method = BaselineRetrievalMethod(
-        retrieval_strategy=RetrievalStrategy(
-            name="OpenAI Embeddings",
-            embedding_model=AIEmbeddingModel(
-                company="openai",
-                model="text-embedding-3-large",
-                # company="cohere", model="embed-english-v3.0"
-            ),
-            embedding_topk=300,
-            rerank_model=None,  # AIRerankModel(company="cohere", model="rerank-english-v3.0"),
-            rerank_topk=50,
-            token_limit=10000,
-        ),
     )
 
     # Create corpus (sorted for consistent processing)
@@ -91,26 +80,62 @@ async def main() -> None:
                     content=f.read(),
                 )
             )
-    print(f"Num Documents: {len(corpus)}")
-    print(f"Num Corpus Characters: {sum(len(document.content) for document in corpus)}")
-    print(f"Num Queries: {len(benchmark.tests)}")
 
-    benchmark_result = await run_benchmark(
-        benchmark.tests,
-        corpus,
-        retrieval_method,
-        weights=weights,
-    )
-
-    # Save the results
+    # Create a save location for this run
     run_name = dt.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     benchmark_path = f"./benchmark_results/{run_name}"
     os.makedirs(benchmark_path, exist_ok=True)
-    with open(f"{benchmark_path}/results.json", "w") as f:
-        f.write(benchmark_result.model_dump_json(indent=4))
 
-    print(f"Avg Recall: {100*benchmark_result.avg_recall:.2f}%")
-    print(f"Avg Precision: {100*benchmark_result.avg_precision:.2f}%")
+    rows: list[dict[str, str | None | int | float]] = []
+    for i, retrieval_strategy in enumerate(RETRIEVAL_STRATEGIES):
+        retrieval_method = BaselineRetrievalMethod(
+            retrieval_strategy=retrieval_strategy,
+        )
+        print(f"Num Documents: {len(corpus)}")
+        print(
+            f"Num Corpus Characters: {sum(len(document.content) for document in corpus)}"
+        )
+        print(f"Num Queries: {len(benchmark.tests)}")
+
+        benchmark_result = await run_benchmark(
+            benchmark.tests,
+            corpus,
+            retrieval_method,
+            weights=weights,
+        )
+
+        # Save the results
+        with open(f"{benchmark_path}/{i}_results.json", "w") as f:
+            f.write(benchmark_result.model_dump_json(indent=4))
+
+        row: dict[str, str | None | int | float] = {
+            "i": i,
+            "chunk_strategy_name": retrieval_strategy.chunking_strategy.strategy_name,
+            "chunk_size": retrieval_strategy.chunking_strategy.chunk_size,
+            "top_k": retrieval_strategy.embedding_topk,
+            "rerank_model": retrieval_strategy.rerank_model.company
+            if retrieval_strategy.rerank_model is not None
+            else None,
+            "top_k_rerank": retrieval_strategy.rerank_topk,
+            "token_limit": retrieval_strategy.token_limit,
+        }
+        row["recall"] = benchmark_result.avg_recall
+        row["precision"] = benchmark_result.avg_precision
+        for benchmark_name in benchmark_name_to_weight:
+            avg_recall, avg_precision = benchmark_result.get_avg_recall_and_precision(
+                benchmark_name
+            )
+            row[f"{benchmark_name}|recall"] = avg_recall
+            row[f"{benchmark_name}|precision"] = avg_precision
+            print(f"{benchmark_name} Avg Recall: {100*avg_recall:.2f}%")
+            print(f"{benchmark_name} Avg Precision: {100*avg_precision:.2f}%")
+        print(f"Avg Recall: {100*benchmark_result.avg_recall:.2f}%")
+        print(f"Avg Precision: {100*benchmark_result.avg_precision:.2f}%")
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    df.to_csv(f"{benchmark_path}/results.csv", index=False)
+
+    print(f'All Benchmark runs saved to: "{benchmark_path}"')
 
 
 if __name__ == "__main__":

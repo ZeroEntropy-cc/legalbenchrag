@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import struct
-from typing import cast
+from typing import Literal, cast
 
 import sqlite_vec  # type: ignore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -31,13 +31,18 @@ def serialize_f32(vector: list[float]) -> bytes:
 SHOW_LOADING_BAR = True
 
 
+class ChunkingStrategy(BaseModel):
+    strategy_name: Literal["naive", "rcts"]
+    chunk_size: int
+
+
 class RetrievalStrategy(BaseModel):
-    name: str
+    chunking_strategy: ChunkingStrategy
     embedding_model: AIEmbeddingModel
     embedding_topk: int
     rerank_model: AIRerankModel | None
     rerank_topk: int
-    token_limit: int
+    token_limit: int | None
 
 
 class EmbeddingInfo(BaseModel):
@@ -82,15 +87,33 @@ class BaselineRetrievalMethod(RetrievalMethod):
         chunks: list[Chunk] = []
         for document_id, document in self.documents.items():
             # Get chunks
-            synthetic_data_splitter = RecursiveCharacterTextSplitter(
-                separators=["\n\n", "\n", "!", "?", ".", ":", ";", ",", " ", ""],
-                chunk_size=500,
-                chunk_overlap=0,
-                length_function=len,
-                is_separator_regex=False,
-                strip_whitespace=False,
-            )
-            text_splits = synthetic_data_splitter.split_text(document.content)
+            chunk_size = self.retrieval_strategy.chunking_strategy.chunk_size
+            match self.retrieval_strategy.chunking_strategy.strategy_name:
+                case "naive":
+                    text_splits: list[str] = []
+                    for i in range(0, len(document.content), chunk_size):
+                        text_splits.append(document.content[i : i + chunk_size])
+                case "rcts":
+                    synthetic_data_splitter = RecursiveCharacterTextSplitter(
+                        separators=[
+                            "\n\n",
+                            "\n",
+                            "!",
+                            "?",
+                            ".",
+                            ":",
+                            ";",
+                            ",",
+                            " ",
+                            "",
+                        ],
+                        chunk_size=chunk_size,
+                        chunk_overlap=0,
+                        length_function=len,
+                        is_separator_regex=False,
+                        strip_whitespace=False,
+                    )
+                    text_splits = synthetic_data_splitter.split_text(document.content)
             assert sum(len(text_split) for text_split in text_splits) == len(
                 document.content
             )
@@ -113,7 +136,9 @@ class BaselineRetrievalMethod(RetrievalMethod):
         # Calculate embeddings
         progress_bar: tqdm | None = None
         if SHOW_LOADING_BAR:
-            progress_bar = tqdm(total=len(chunks), desc="Processing", ncols=100)
+            progress_bar = tqdm(
+                total=len(chunks), desc="Processing Embeddings", ncols=100
+            )
 
         EMBEDDING_BATCH_SIZE = 2048
         self.embedding_infos = []
@@ -208,10 +233,11 @@ class BaselineRetrievalMethod(RetrievalMethod):
         remaining_tokens = self.retrieval_strategy.token_limit
         retrieved_snippets: list[RetrievedSnippet] = []
         for i, embedding_info in enumerate(retrieved_embedding_infos):
-            if remaining_tokens <= 0:
+            if remaining_tokens is not None and remaining_tokens <= 0:
                 break
             span = embedding_info.span
-            span = (span[0], min(span[1], span[0] + remaining_tokens))
+            if remaining_tokens is not None:
+                span = (span[0], min(span[1], span[0] + remaining_tokens))
             retrieved_snippets.append(
                 RetrievedSnippet(
                     file_path=embedding_info.document_id,
@@ -219,7 +245,8 @@ class BaselineRetrievalMethod(RetrievalMethod):
                     score=1.0 / (i + 1),
                 )
             )
-            remaining_tokens -= span[1] - span[0]
+            if remaining_tokens is not None:
+                remaining_tokens -= span[1] - span[0]
         return QueryResponse(retrieved_snippets=retrieved_snippets)
 
     def get_embedding_info_text(self, embedding_info: EmbeddingInfo) -> str:

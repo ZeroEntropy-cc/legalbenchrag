@@ -30,3 +30,9 @@ vim ./credentials/credentials.toml
 ```bash
 python ./legalbenchrag/generate
 ```
+
+5. Run the benchmark script
+
+```bash
+python ./legalbenchrag/benchmark.py
+```
